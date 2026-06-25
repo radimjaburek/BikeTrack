@@ -36,9 +36,11 @@ dependencies:
   latlong2: ^0.9.1
   geolocator: ^13.0.0
   http: ^1.2.0
-  flutter_web_auth_2: ^3.0.0
+  flutter_web_auth_2: ^5.0.0
   receive_sharing_intent: ^1.8.1
+  shared_preferences: ^2.3.3
   xml: ^6.5.0
+  health: ^11.0.0
 
 dev_dependencies:
   flutter_test:

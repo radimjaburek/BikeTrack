@@ -1,22 +1,17 @@
 import 'dart:async';
-import 'dart:convert';
-import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart' hide Path;
 import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
-import 'package:flutter_web_auth_2/flutter_web_auth_2.dart';
-import 'package:receive_sharing_intent/receive_sharing_intent.dart';
-import 'package:xml/xml.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'services/health_service.dart';
 
-// Zaregistruj svou aplikaci na https://www.strava.com/settings/api
-// a vyplň níže client_id a client_secret.
-const _stravaClientId = 'YOUR_CLIENT_ID';
-const _stravaClientSecret = 'YOUR_CLIENT_SECRET';
-
-void main() => runApp(const BikeTrackApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await HealthService.configure();
+  runApp(const BikeTrackApp());
+}
 
 class BikeTrackApp extends StatelessWidget {
   const BikeTrackApp({super.key});
@@ -406,46 +401,6 @@ class _Route {
   });
 }
 
-// ── GPX parsing ───────────────────────────────────────────────────────────────
-
-double _haversineKm(double lat1, double lon1, double lat2, double lon2) {
-  const r = 6371.0;
-  final dLat = (lat2 - lat1) * pi / 180;
-  final dLon = (lon2 - lon1) * pi / 180;
-  final a = sin(dLat / 2) * sin(dLat / 2) +
-      cos(lat1 * pi / 180) *
-          cos(lat2 * pi / 180) *
-          sin(dLon / 2) *
-          sin(dLon / 2);
-  return r * 2 * atan2(sqrt(a), sqrt(1 - a));
-}
-
-_Route? _parseGpx(String content, String fileName) {
-  try {
-    final doc = XmlDocument.parse(content);
-    final trkName = doc.findAllElements('name').firstOrNull?.innerText.trim();
-    final timeStr = doc.findAllElements('time').firstOrNull?.innerText.trim();
-    final DateTime? date = timeStr != null ? DateTime.tryParse(timeStr) : null;
-    final points = doc.findAllElements('trkpt').toList();
-    double dist = 0;
-    for (int i = 1; i < points.length; i++) {
-      final lat1 =
-          double.tryParse(points[i - 1].getAttribute('lat') ?? '') ?? 0;
-      final lon1 =
-          double.tryParse(points[i - 1].getAttribute('lon') ?? '') ?? 0;
-      final lat2 = double.tryParse(points[i].getAttribute('lat') ?? '') ?? 0;
-      final lon2 = double.tryParse(points[i].getAttribute('lon') ?? '') ?? 0;
-      dist += _haversineKm(lat1, lon1, lat2, lon2);
-    }
-    return _Route(
-      name: (trkName != null && trkName.isNotEmpty) ? trkName : fileName,
-      date: date,
-      distanceKm: dist,
-    );
-  } catch (_) {
-    return null;
-  }
-}
 
 // ── Profile page ──────────────────────────────────────────────────────────────
 
@@ -458,327 +413,253 @@ class _ProfilePage extends StatefulWidget {
 
 class _ProfilePageState extends State<_ProfilePage> {
   final List<_Route> _routes = [];
-  bool _stravaLoading = false;
-  StreamSubscription? _intentSub;
+  bool _hcConnected = false;
+  bool _connecting = false;
+  bool _loadingActivities = false;
+  final _health = HealthService();
 
-  static const _bikeTypes = {
-    'Ride', 'VirtualRide', 'MountainBikeRide',
-    'GravelRide', 'EBikeRide', 'EMountainBikeRide',
-  };
+  static const _prefKey = 'hc_connected';
 
   @override
   void initState() {
     super.initState();
-    // Příjem GPX sdíleného z Garmin Connect (app bylo zavřené)
-    ReceiveSharingIntent.instance
-        .getInitialMedia()
-        .then(_handleSharedFiles);
-    // Příjem GPX sdíleného z Garmin Connect (app běží na pozadí)
-    _intentSub = ReceiveSharingIntent.instance
-        .getMediaStream()
-        .listen(_handleSharedFiles);
+    _init();
   }
 
-  @override
-  void dispose() {
-    _intentSub?.cancel();
-    super.dispose();
-  }
-
-  Future<void> _handleSharedFiles(List<SharedMediaFile> files) async {
-    for (final f in files) {
-      final path = f.path;
-      if (!path.toLowerCase().endsWith('.gpx')) continue;
-      try {
-        final content = await File(path).readAsString();
-        final name = path.split('/').last;
-        final route = _parseGpx(content, name);
-        if (route != null && mounted) {
-          setState(() => _routes.add(route));
-          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-            content: Text('Přidána: ${route.name}'),
-            backgroundColor: const Color(0xFF00FF41),
-            behavior: SnackBarBehavior.floating,
-          ));
-        }
-      } catch (_) {}
+  Future<void> _init() async {
+    final prefs = await SharedPreferences.getInstance();
+    final wasConnected = prefs.getBool(_prefKey) ?? false;
+    if (!wasConnected) return;
+    final available = await _health.checkAvailability();
+    if (available == HealthConnectStatus.notInstalled) {
+      await SharedPreferences.getInstance().then((p) => p.setBool(_prefKey, false));
+      return;
+    }
+    final hasPerms = await _health.hasPermissions();
+    if (!mounted) return;
+    if (hasPerms) {
+      setState(() => _hcConnected = true);
+      _loadActivities();
+    } else {
+      await SharedPreferences.getInstance().then((p) => p.setBool(_prefKey, false));
     }
   }
 
-  // ── Strava OAuth ────────────────────────────────────────────────────────────
-
-  Future<void> _loadStrava() async {
-    setState(() => _stravaLoading = true);
+  Future<void> _connect({bool garminFlow = false}) async {
+    setState(() => _connecting = true);
     try {
-      final authUri = Uri.https('www.strava.com', '/oauth/mobile/authorize', {
-        'client_id': _stravaClientId,
-        'redirect_uri': 'biketrack://oauth-callback',
-        'response_type': 'code',
-        'approval_prompt': 'auto',
-        'scope': 'activity:read_all',
-      });
-
-      final result = await FlutterWebAuth2.authenticate(
-        url: authUri.toString(),
-        callbackUrlScheme: 'biketrack',
-      );
-
-      final code = Uri.parse(result).queryParameters['code'];
-      if (code == null) throw Exception('Chybí kód od Strava');
-
-      final tokenRes = await http.post(
-        Uri.https('www.strava.com', '/oauth/token'),
-        body: {
-          'client_id': _stravaClientId,
-          'client_secret': _stravaClientSecret,
-          'code': code,
-          'grant_type': 'authorization_code',
-        },
-      );
-      if (tokenRes.statusCode != 200) {
-        throw Exception('Token chyba ${tokenRes.statusCode}');
-      }
-
-      final token =
-          (jsonDecode(tokenRes.body) as Map)['access_token'] as String?;
-      if (token == null) throw Exception('Chybí access_token');
-
-      final after = DateTime.now()
-              .subtract(const Duration(days: 90))
-              .millisecondsSinceEpoch ~/
-          1000;
-
-      final actRes = await http.get(
-        Uri.https('www.strava.com', '/api/v3/athlete/activities', {
-          'per_page': '100',
-          'after': '$after',
-        }),
-        headers: {'Authorization': 'Bearer $token'},
-      );
-      if (actRes.statusCode != 200) {
-        throw Exception('API chyba ${actRes.statusCode}');
-      }
-
-      final all =
-          (jsonDecode(actRes.body) as List).cast<Map<String, dynamic>>();
-      final rides = all
-          .where((a) => _bikeTypes.contains(a['type']))
-          .map((a) => _Route(
-                name: a['name'] as String? ?? 'Jízda',
-                date: DateTime.tryParse(
-                    a['start_date_local'] as String? ?? ''),
-                distanceKm: ((a['distance'] as num?) ?? 0) / 1000,
-              ))
-          .toList();
-
+      final availability = await _health.checkAvailability();
       if (!mounted) return;
-      if (rides.isEmpty) {
+
+      if (availability == HealthConnectStatus.notInstalled) {
+        final install = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: const Color(0xFF1A1A1A),
+            title: const Text('Health Connect'),
+            content: const Text(
+              'Health Connect není nainstalovaný. Je potřeba ho stáhnout z Play Store '
+              '(zdarma, od Google).',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Zrušit', style: TextStyle(color: Colors.grey)),
+              ),
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Stáhnout', style: TextStyle(color: Color(0xFF1A73E8))),
+              ),
+            ],
+          ),
+        );
+        if (install == true) await _health.promptInstall();
+        return;
+      }
+
+      if (garminFlow && mounted) {
+        await showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: const Color(0xFF1A1A1A),
+            title: Row(children: [
+              const Icon(Icons.watch, color: Color(0xFF0066CC), size: 20),
+              const SizedBox(width: 8),
+              const Text('Garmin Connect'),
+            ]),
+            content: const Text(
+              'Garmin Connect synchronizuje tvoje aktivity přes Health Connect.\n\n'
+              'Po připojení:\n'
+              '1. Otevři Garmin Connect\n'
+              '2. Profil → Nastavení → Health Connect\n'
+              '3. Zapni synchronizaci\n\n'
+              'Pak se tvoje jízdy automaticky objeví v BikeTrack.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Rozumím', style: TextStyle(color: Color(0xFF0066CC))),
+              ),
+            ],
+          ),
+        );
+        if (!mounted) return;
+      }
+
+      final granted = await _health.requestPermissions();
+      if (!mounted) return;
+      if (!granted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Žádné jízdy za posledních 90 dní'),
-          backgroundColor: Color(0xFF333333),
+          content: Text('Přístup k Health Connect odepřen'),
           behavior: SnackBarBehavior.floating,
         ));
         return;
       }
-      _showRidesSheet(rides);
+
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_prefKey, true);
+      setState(() => _hcConnected = true);
+      _loadActivities();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Strava: $e'),
+          content: Text('Chyba: $e'),
           behavior: SnackBarBehavior.floating,
         ));
       }
     } finally {
-      if (mounted) setState(() => _stravaLoading = false);
+      if (mounted) setState(() => _connecting = false);
     }
   }
 
-  void _showRidesSheet(List<_Route> rides) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF0D0D0D),
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) => DraggableScrollableSheet(
-        initialChildSize: 0.6,
-        maxChildSize: 0.9,
-        minChildSize: 0.3,
-        expand: false,
-        builder: (_, scroll) => Column(children: [
-          const SizedBox(height: 8),
-          Container(
-            width: 36,
-            height: 4,
-            decoration: BoxDecoration(
-              color: Colors.grey[700],
-              borderRadius: BorderRadius.circular(2),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            child: Row(children: [
-              Text('${rides.length} jízd ze Strava',
-                  style: const TextStyle(
-                      fontSize: 16, fontWeight: FontWeight.bold)),
-              const Spacer(),
-              TextButton(
-                onPressed: () {
-                  setState(() => _routes.addAll(rides));
-                  Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-                    content: Text('${rides.length} tras přidáno'),
-                    backgroundColor: const Color(0xFF00FF41),
-                    behavior: SnackBarBehavior.floating,
-                  ));
-                },
-                child: const Text('Přidat vše',
-                    style: TextStyle(color: Color(0xFF00FF41))),
-              ),
-            ]),
-          ),
-          const Divider(height: 1, color: Color(0xFF1A1A1A)),
-          Expanded(
-            child: ListView.builder(
-              controller: scroll,
-              itemCount: rides.length,
-              itemBuilder: (_, i) {
-                final r = rides[i];
-                final d = r.date;
-                return ListTile(
-                  leading: Container(
-                    width: 40,
-                    height: 40,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFF111111),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: const Icon(Icons.directions_bike,
-                        color: Color(0xFF00FF41), size: 20),
-                  ),
-                  title: Text(r.name,
-                      style: const TextStyle(
-                          fontSize: 14, fontWeight: FontWeight.w500),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis),
-                  subtitle: Text(
-                    d != null
-                        ? '${d.day}.${d.month}.${d.year}  ·  ${r.distanceKm.toStringAsFixed(1)} km'
-                        : '${r.distanceKm.toStringAsFixed(1)} km',
-                    style: TextStyle(color: Colors.grey[600], fontSize: 12),
-                  ),
-                  trailing: IconButton(
-                    icon: const Icon(Icons.add_circle,
-                        color: Color(0xFF00FF41), size: 28),
-                    onPressed: () {
-                      setState(() => _routes.add(r));
-                      Navigator.pop(ctx);
-                      ScaffoldMessenger.of(context)
-                          .showSnackBar(const SnackBar(
-                        content: Text('Trasa přidána'),
-                        backgroundColor: Color(0xFF00FF41),
-                        behavior: SnackBarBehavior.floating,
-                      ));
-                    },
-                  ),
-                );
-              },
-            ),
-          ),
-        ]),
-      ),
-    );
+  Future<void> _disconnect() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_prefKey, false);
+    setState(() {
+      _hcConnected = false;
+      _routes.clear();
+    });
   }
 
-  // ── Garmin instructions ─────────────────────────────────────────────────────
-
-  void _showGarminHelp() {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: const Color(0xFF0D0D0D),
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) => Padding(
-        padding: const EdgeInsets.fromLTRB(24, 20, 24, 32),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Container(
-            width: 36,
-            height: 4,
-            margin: const EdgeInsets.only(bottom: 20),
-            decoration: BoxDecoration(
-              color: Colors.grey[700],
-              borderRadius: BorderRadius.circular(2),
-            ),
-          ),
-          Row(children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: const Color(0xFF1A1A2E),
-                borderRadius: BorderRadius.circular(10),
-              ),
-              child: const Icon(Icons.watch, color: Color(0xFF0066CC), size: 22),
-            ),
-            const SizedBox(width: 12),
-            const Text('Sdílení z Garmin Connect',
-                style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
-          ]),
-          const SizedBox(height: 20),
-          _garminStep('1', 'Otevři Garmin Connect a tap na aktivitu'),
-          _garminStep('2', 'Klikni na ··· (tři tečky) vpravo nahoře'),
-          _garminStep('3', 'Vyber „Sdílet aktivitu"'),
-          _garminStep('4', 'Tap „Exportovat soubor" → vyber GPX'),
-          _garminStep('5', 'Ze sdílení vyber BikeTrack'),
-          const SizedBox(height: 4),
-          Text(
-            'Aktivita se přidá automaticky hned po sdílení.',
-            style: TextStyle(color: Colors.grey[500], fontSize: 12),
-          ),
-        ]),
-      ),
-    );
-  }
-
-  Widget _garminStep(String num, String text) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Container(
-          width: 24,
-          height: 24,
-          decoration: BoxDecoration(
-            color: const Color(0xFF0066CC),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Center(
-            child: Text(num,
-                style: const TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white)),
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.only(top: 3),
-            child: Text(text,
-                style: const TextStyle(fontSize: 14, height: 1.4)),
-          ),
-        ),
-      ]),
-    );
+  Future<void> _loadActivities() async {
+    setState(() => _loadingActivities = true);
+    try {
+      final activities = await _health.getCyclingActivities();
+      if (!mounted) return;
+      setState(() {
+        _routes
+          ..clear()
+          ..addAll(activities.map((a) => _Route(
+                name: a.name,
+                date: a.startTime,
+                distanceKm: a.distanceKm,
+              )));
+      });
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Chyba načítání: $e'),
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
+    } finally {
+      if (mounted) setState(() => _loadingActivities = false);
+    }
   }
 
   // ── Build ───────────────────────────────────────────────────────────────────
+
+  Widget _connectionCard({
+    required Color color,
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required bool connected,
+    required bool loading,
+    required VoidCallback onConnect,
+    required VoidCallback onDisconnect,
+  }) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF111111),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: connected ? color.withOpacity(0.4) : const Color(0xFF1F1F1F),
+        ),
+      ),
+      child: ListTile(
+        contentPadding: const EdgeInsets.fromLTRB(14, 8, 10, 8),
+        leading: Container(
+          width: 44,
+          height: 44,
+          decoration: BoxDecoration(
+            color: color.withOpacity(connected ? 0.2 : 0.1),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Icon(icon, color: color, size: 22),
+        ),
+        title: Row(children: [
+          Text(title,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+          if (connected) ...[
+            const SizedBox(width: 6),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: const Color(0xFF00FF41).withOpacity(0.15),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text('Připojeno',
+                  style: TextStyle(
+                      fontSize: 9,
+                      color: Color(0xFF00FF41),
+                      fontWeight: FontWeight.w600)),
+            ),
+          ],
+        ]),
+        subtitle: Padding(
+          padding: const EdgeInsets.only(top: 2),
+          child: Text(subtitle,
+              style: TextStyle(fontSize: 11, color: Colors.grey[500])),
+        ),
+        trailing: loading
+            ? SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(strokeWidth: 2, color: color),
+              )
+            : connected
+                ? IconButton(
+                    icon: Icon(Icons.link_off, color: Colors.grey[600], size: 18),
+                    onPressed: onDisconnect,
+                    tooltip: 'Odpojit',
+                  )
+                : TextButton(
+                    onPressed: onConnect,
+                    style: TextButton.styleFrom(
+                      foregroundColor: color,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 6),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                        side: BorderSide(color: color.withOpacity(0.4)),
+                      ),
+                    ),
+                    child: const Text('Připojit',
+                        style: TextStyle(fontSize: 12)),
+                  ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final totalKm = _routes.fold(0.0, (s, r) => s + r.distanceKm);
     return Column(children: [
+      // ── Stats ──
       Container(
         width: double.infinity,
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
@@ -788,49 +669,61 @@ class _ProfilePageState extends State<_ProfilePage> {
           const SizedBox(width: 8),
           Text('${_routes.length} tras  ·  ${totalKm.toStringAsFixed(1)} km',
               style: TextStyle(color: Colors.grey[400], fontSize: 13)),
+          if (_loadingActivities) ...[
+            const SizedBox(width: 10),
+            const SizedBox(
+              width: 12,
+              height: 12,
+              child: CircularProgressIndicator(
+                  strokeWidth: 2, color: Color(0xFF00FF41)),
+            ),
+          ],
         ]),
       ),
+      // ── Připojení ──
       Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 6),
-        child: SizedBox(
-          width: double.infinity,
-          child: ElevatedButton.icon(
-            onPressed: _stravaLoading ? null : _loadStrava,
-            icon: _stravaLoading
-                ? const SizedBox(
-                    width: 16,
-                    height: 16,
-                    child: CircularProgressIndicator(
-                        strokeWidth: 2, color: Colors.white))
-                : const Icon(Icons.directions_bike),
-            label:
-                Text(_stravaLoading ? 'Načítám...' : 'Načíst jízdy ze Strava'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFFFC4C02),
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text('Připojení',
+              style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey[500],
+                  letterSpacing: 0.8)),
         ),
       ),
+      _connectionCard(
+        color: const Color(0xFF0066CC),
+        icon: Icons.watch,
+        title: 'Garmin Connect',
+        subtitle: 'Synchronizuje jízdy přes Health Connect',
+        connected: _hcConnected,
+        loading: _connecting,
+        onConnect: () => _connect(garminFlow: true),
+        onDisconnect: _disconnect,
+      ),
+      _connectionCard(
+        color: const Color(0xFF1A73E8),
+        icon: Icons.health_and_safety,
+        title: 'Health Connect',
+        subtitle: 'Přímý přístup k cyklo aktivitám (Android)',
+        connected: _hcConnected,
+        loading: _connecting,
+        onConnect: () => _connect(),
+        onDisconnect: _disconnect,
+      ),
+      // ── Trasy ──
       Padding(
-        padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-        child: SizedBox(
-          width: double.infinity,
-          child: OutlinedButton.icon(
-            onPressed: _showGarminHelp,
-            icon: const Icon(Icons.watch, size: 18),
-            label: const Text('Přidat z Garmin Connect'),
-            style: OutlinedButton.styleFrom(
-              foregroundColor: const Color(0xFF0066CC),
-              side: const BorderSide(color: Color(0xFF0066CC), width: 1),
-              padding: const EdgeInsets.symmetric(vertical: 12),
-              shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
-            ),
-          ),
+        padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Text('Trasy',
+              style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.grey[500],
+                  letterSpacing: 0.8)),
         ),
       ),
       const Divider(height: 1, color: Color(0xFF1A1A1A)),
@@ -842,11 +735,13 @@ class _ProfilePageState extends State<_ProfilePage> {
                     size: 64, color: Colors.grey[800]),
                 const SizedBox(height: 12),
                 const Text('Žádné trasy',
-                    style: TextStyle(
-                        fontSize: 18, fontWeight: FontWeight.bold)),
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 const SizedBox(height: 8),
                 Text(
-                  'Načti ze Strava nebo sdílej\naktivitu z Garmin Connect',
+                  _hcConnected
+                      ? 'Žádné cyklistické aktivity\nv Health Connect'
+                      : 'Připoj Garmin nebo Health Connect\na jízdy se načtou automaticky',
                   textAlign: TextAlign.center,
                   style: TextStyle(
                       color: Colors.grey[600], fontSize: 13, height: 1.5),
@@ -855,7 +750,7 @@ class _ProfilePageState extends State<_ProfilePage> {
             : ListView.separated(
                 padding: const EdgeInsets.symmetric(vertical: 8),
                 itemCount: _routes.length,
-                separatorBuilder: (_, _) =>
+                separatorBuilder: (_, __) =>
                     const Divider(height: 1, color: Color(0xFF1A1A1A)),
                 itemBuilder: (context, i) {
                   final r = _routes[i];
@@ -873,8 +768,7 @@ class _ProfilePageState extends State<_ProfilePage> {
                       child: const Icon(Icons.delete_outline,
                           color: Colors.white),
                     ),
-                    onDismissed: (_) =>
-                        setState(() => _routes.removeAt(i)),
+                    onDismissed: (_) => setState(() => _routes.removeAt(i)),
                     child: ListTile(
                       leading: Container(
                         width: 40,
@@ -903,3 +797,5 @@ class _ProfilePageState extends State<_ProfilePage> {
     ]);
   }
 }
+
+
