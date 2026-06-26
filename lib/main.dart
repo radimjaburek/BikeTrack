@@ -427,106 +427,42 @@ class _ProfilePageState extends State<_ProfilePage> {
   }
 
   Future<void> _init() async {
-    final prefs = await SharedPreferences.getInstance();
-    final wasConnected = prefs.getBool(_prefKey) ?? false;
-    if (!wasConnected) return;
-    final available = await _health.checkAvailability();
-    if (available == HealthConnectStatus.notInstalled) {
-      await SharedPreferences.getInstance().then((p) => p.setBool(_prefKey, false));
-      return;
-    }
     final hasPerms = await _health.hasPermissions();
     if (!mounted) return;
     if (hasPerms) {
-      setState(() => _hcConnected = true);
-      _loadActivities();
-    } else {
-      await SharedPreferences.getInstance().then((p) => p.setBool(_prefKey, false));
-    }
-  }
-
-  Future<void> _connect({bool garminFlow = false}) async {
-    setState(() => _connecting = true);
-    try {
-      final availability = await _health.checkAvailability();
-      if (!mounted) return;
-
-      if (availability == HealthConnectStatus.notInstalled) {
-        final install = await showDialog<bool>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: const Color(0xFF1A1A1A),
-            title: const Text('Health Connect'),
-            content: const Text(
-              'Health Connect není nainstalovaný. Je potřeba ho stáhnout z Play Store '
-              '(zdarma, od Google).',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('Zrušit', style: TextStyle(color: Colors.grey)),
-              ),
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('Stáhnout', style: TextStyle(color: Color(0xFF1A73E8))),
-              ),
-            ],
-          ),
-        );
-        if (install == true) await _health.promptInstall();
-        return;
-      }
-
-      if (garminFlow && mounted) {
-        await showDialog(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: const Color(0xFF1A1A1A),
-            title: Row(children: [
-              const Icon(Icons.watch, color: Color(0xFF0066CC), size: 20),
-              const SizedBox(width: 8),
-              const Text('Garmin Connect'),
-            ]),
-            content: const Text(
-              'Garmin Connect synchronizuje tvoje aktivity přes Health Connect.\n\n'
-              'Po připojení:\n'
-              '1. Otevři Garmin Connect\n'
-              '2. Profil → Nastavení → Health Connect\n'
-              '3. Zapni synchronizaci\n\n'
-              'Pak se tvoje jízdy automaticky objeví v BikeTrack.',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: const Text('Rozumím', style: TextStyle(color: Color(0xFF0066CC))),
-              ),
-            ],
-          ),
-        );
-        if (!mounted) return;
-      }
-
-      final granted = await _health.requestPermissions();
-      if (!mounted) return;
-      if (!granted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Přístup k Health Connect odepřen'),
-          behavior: SnackBarBehavior.floating,
-        ));
-        return;
-      }
-
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_prefKey, true);
       setState(() => _hcConnected = true);
       _loadActivities();
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Chyba: $e'),
-          behavior: SnackBarBehavior.floating,
-        ));
+    }
+  }
+
+  Future<void> _connect() async {
+    setState(() => _connecting = true);
+    try {
+      final already = await _health.hasPermissions();
+      if (!mounted) return;
+      if (already) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_prefKey, true);
+        setState(() => _hcConnected = true);
+        _loadActivities();
+        return;
       }
+
+      final granted = await _health.requestPermissions();
+      if (!mounted) return;
+      if (granted) {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_prefKey, true);
+        setState(() => _hcConnected = true);
+        _loadActivities();
+      } else {
+        await _health.openPermissionsScreen();
+      }
+    } catch (_) {
+      if (!mounted) return;
+      await _health.promptInstall();
     } finally {
       if (mounted) setState(() => _connecting = false);
     }
@@ -555,37 +491,145 @@ class _ProfilePageState extends State<_ProfilePage> {
                 distanceKm: a.distanceKm,
               )));
       });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('Chyba načítání: $e'),
-          behavior: SnackBarBehavior.floating,
-        ));
-      }
+    } catch (_) {
     } finally {
       if (mounted) setState(() => _loadingActivities = false);
     }
   }
 
-  // ── Build ───────────────────────────────────────────────────────────────────
+  @override
+  Widget build(BuildContext context) {
+    final totalKm = _routes.fold(0.0, (s, r) => s + r.distanceKm);
 
-  Widget _connectionCard({
-    required Color color,
-    required IconData icon,
-    required String title,
-    required String subtitle,
-    required bool connected,
-    required bool loading,
-    required VoidCallback onConnect,
-    required VoidCallback onDisconnect,
-  }) {
+    return Column(children: [
+      // ── Připojení ──────────────────────────────────────────────────────────
+      _HcCard(
+        connected: _hcConnected,
+        loading: _connecting,
+        onConnect: _connect,
+        onDisconnect: _disconnect,
+      ),
+      // ── Garmin info ────────────────────────────────────────────────────────
+      if (_hcConnected)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 0),
+          child: Row(children: [
+            const Icon(Icons.watch, color: Color(0xFF0066CC), size: 14),
+            const SizedBox(width: 6),
+            Text('Garmin Connect synchronizuje automaticky',
+                style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+          ]),
+        ),
+      // ── Stats ──────────────────────────────────────────────────────────────
+      if (_hcConnected)
+        Container(
+          width: double.infinity,
+          margin: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0A0A0A),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Row(children: [
+            const Icon(Icons.route, color: Color(0xFF00FF41), size: 14),
+            const SizedBox(width: 8),
+            Text('${_routes.length} tras · ${totalKm.toStringAsFixed(1)} km',
+                style: TextStyle(color: Colors.grey[400], fontSize: 13)),
+            if (_loadingActivities) ...[
+              const SizedBox(width: 10),
+              const SizedBox(
+                width: 11,
+                height: 11,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: Color(0xFF00FF41)),
+              ),
+            ],
+          ]),
+        ),
+      const SizedBox(height: 8),
+      const Divider(height: 1, color: Color(0xFF1A1A1A)),
+      // ── Trasy ──────────────────────────────────────────────────────────────
+      Expanded(
+        child: _routes.isEmpty
+            ? Center(
+                child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.directions_bike, size: 56, color: Colors.grey[800]),
+                const SizedBox(height: 12),
+                Text(
+                  _hcConnected
+                      ? 'Žádné cyklistické aktivity\nv Health Connect'
+                      : 'Připoj Health Connect\na jízdy se načtou automaticky',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      color: Colors.grey[600], fontSize: 13, height: 1.5),
+                ),
+              ]))
+            : ListView.separated(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                itemCount: _routes.length,
+                separatorBuilder: (_, _) =>
+                    const Divider(height: 1, color: Color(0xFF1A1A1A)),
+                itemBuilder: (context, i) {
+                  final r = _routes[i];
+                  final d = r.date;
+                  final dateStr =
+                      d != null ? '${d.day}.${d.month}.${d.year}' : '—';
+                  return ListTile(
+                    leading: Container(
+                      width: 38,
+                      height: 38,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF111111),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Icon(Icons.directions_bike,
+                          color: Color(0xFF00FF41), size: 18),
+                    ),
+                    title: Text(r.name,
+                        style: const TextStyle(
+                            fontSize: 14, fontWeight: FontWeight.w500),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis),
+                    subtitle: Text(
+                        '$dateStr · ${r.distanceKm.toStringAsFixed(2)} km',
+                        style:
+                            TextStyle(color: Colors.grey[600], fontSize: 11)),
+                  );
+                },
+              ),
+      ),
+    ]);
+  }
+}
+
+// ── Health Connect card ───────────────────────────────────────────────────────
+
+class _HcCard extends StatelessWidget {
+  final bool connected;
+  final bool loading;
+  final VoidCallback onConnect;
+  final VoidCallback onDisconnect;
+
+  const _HcCard({
+    required this.connected,
+    required this.loading,
+    required this.onConnect,
+    required this.onDisconnect,
+  });
+
+  static const _blue = Color(0xFF1A73E8);
+
+  @override
+  Widget build(BuildContext context) {
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 5),
+      margin: const EdgeInsets.fromLTRB(16, 16, 16, 8),
       decoration: BoxDecoration(
         color: const Color(0xFF111111),
         borderRadius: BorderRadius.circular(14),
         border: Border.all(
-          color: connected ? color.withOpacity(0.4) : const Color(0xFF1F1F1F),
+          color: connected
+              ? _blue.withValues(alpha: 0.5)
+              : const Color(0xFF1F1F1F),
         ),
       ),
       child: ListTile(
@@ -594,207 +638,67 @@ class _ProfilePageState extends State<_ProfilePage> {
           width: 44,
           height: 44,
           decoration: BoxDecoration(
-            color: color.withOpacity(connected ? 0.2 : 0.1),
+            color: _blue.withValues(alpha: connected ? 0.2 : 0.1),
             borderRadius: BorderRadius.circular(12),
           ),
-          child: Icon(icon, color: color, size: 22),
+          child: const Icon(Icons.health_and_safety, color: _blue, size: 22),
         ),
         title: Row(children: [
-          Text(title,
-              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+          const Text('Health Connect',
+              style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
           if (connected) ...[
-            const SizedBox(width: 6),
+            const SizedBox(width: 8),
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
               decoration: BoxDecoration(
-                color: const Color(0xFF00FF41).withOpacity(0.15),
+                color: const Color(0xFF00FF41).withValues(alpha: 0.15),
                 borderRadius: BorderRadius.circular(4),
               ),
               child: const Text('Připojeno',
                   style: TextStyle(
-                      fontSize: 9,
+                      fontSize: 10,
                       color: Color(0xFF00FF41),
-                      fontWeight: FontWeight.w600)),
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.2)),
             ),
           ],
         ]),
-        subtitle: Padding(
-          padding: const EdgeInsets.only(top: 2),
-          child: Text(subtitle,
-              style: TextStyle(fontSize: 11, color: Colors.grey[500])),
-        ),
+        subtitle: connected
+            ? null
+            : const Padding(
+                padding: EdgeInsets.only(top: 2),
+                child: Text('Klikni pro připojení',
+                    style: TextStyle(fontSize: 11, color: Colors.grey)),
+              ),
         trailing: loading
-            ? SizedBox(
+            ? const SizedBox(
                 width: 20,
                 height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2, color: color),
+                child: CircularProgressIndicator(strokeWidth: 2, color: _blue),
               )
             : connected
                 ? IconButton(
-                    icon: Icon(Icons.link_off, color: Colors.grey[600], size: 18),
+                    icon: Icon(Icons.link_off,
+                        color: Colors.grey[600], size: 18),
                     onPressed: onDisconnect,
                     tooltip: 'Odpojit',
                   )
-                : TextButton(
+                : FilledButton(
                     onPressed: onConnect,
-                    style: TextButton.styleFrom(
-                      foregroundColor: color,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: _blue,
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
+                          horizontal: 16, vertical: 8),
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                       shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8),
-                        side: BorderSide(color: color.withOpacity(0.4)),
-                      ),
+                          borderRadius: BorderRadius.circular(8)),
                     ),
                     child: const Text('Připojit',
                         style: TextStyle(fontSize: 12)),
                   ),
       ),
     );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final totalKm = _routes.fold(0.0, (s, r) => s + r.distanceKm);
-    return Column(children: [
-      // ── Stats ──
-      Container(
-        width: double.infinity,
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-        color: const Color(0xFF0A0A0A),
-        child: Row(children: [
-          const Icon(Icons.route, color: Color(0xFF00FF41), size: 16),
-          const SizedBox(width: 8),
-          Text('${_routes.length} tras  ·  ${totalKm.toStringAsFixed(1)} km',
-              style: TextStyle(color: Colors.grey[400], fontSize: 13)),
-          if (_loadingActivities) ...[
-            const SizedBox(width: 10),
-            const SizedBox(
-              width: 12,
-              height: 12,
-              child: CircularProgressIndicator(
-                  strokeWidth: 2, color: Color(0xFF00FF41)),
-            ),
-          ],
-        ]),
-      ),
-      // ── Připojení ──
-      Padding(
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: Text('Připojení',
-              style: TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.grey[500],
-                  letterSpacing: 0.8)),
-        ),
-      ),
-      _connectionCard(
-        color: const Color(0xFF0066CC),
-        icon: Icons.watch,
-        title: 'Garmin Connect',
-        subtitle: 'Synchronizuje jízdy přes Health Connect',
-        connected: _hcConnected,
-        loading: _connecting,
-        onConnect: () => _connect(garminFlow: true),
-        onDisconnect: _disconnect,
-      ),
-      _connectionCard(
-        color: const Color(0xFF1A73E8),
-        icon: Icons.health_and_safety,
-        title: 'Health Connect',
-        subtitle: 'Přímý přístup k cyklo aktivitám (Android)',
-        connected: _hcConnected,
-        loading: _connecting,
-        onConnect: () => _connect(),
-        onDisconnect: _disconnect,
-      ),
-      // ── Trasy ──
-      Padding(
-        padding: const EdgeInsets.fromLTRB(16, 14, 16, 4),
-        child: Align(
-          alignment: Alignment.centerLeft,
-          child: Text('Trasy',
-              style: TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.grey[500],
-                  letterSpacing: 0.8)),
-        ),
-      ),
-      const Divider(height: 1, color: Color(0xFF1A1A1A)),
-      Expanded(
-        child: _routes.isEmpty
-            ? Center(
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                Icon(Icons.directions_bike,
-                    size: 64, color: Colors.grey[800]),
-                const SizedBox(height: 12),
-                const Text('Žádné trasy',
-                    style:
-                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                const SizedBox(height: 8),
-                Text(
-                  _hcConnected
-                      ? 'Žádné cyklistické aktivity\nv Health Connect'
-                      : 'Připoj Garmin nebo Health Connect\na jízdy se načtou automaticky',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(
-                      color: Colors.grey[600], fontSize: 13, height: 1.5),
-                ),
-              ]))
-            : ListView.separated(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                itemCount: _routes.length,
-                separatorBuilder: (_, __) =>
-                    const Divider(height: 1, color: Color(0xFF1A1A1A)),
-                itemBuilder: (context, i) {
-                  final r = _routes[i];
-                  final dateStr = r.date != null
-                      ? '${r.date!.day}.${r.date!.month}.${r.date!.year}'
-                      : '—';
-                  return Dismissible(
-                    key: ValueKey(
-                        '${r.date?.millisecondsSinceEpoch ?? i}_${r.name}'),
-                    direction: DismissDirection.endToStart,
-                    background: Container(
-                      alignment: Alignment.centerRight,
-                      padding: const EdgeInsets.only(right: 20),
-                      color: Colors.red[900],
-                      child: const Icon(Icons.delete_outline,
-                          color: Colors.white),
-                    ),
-                    onDismissed: (_) => setState(() => _routes.removeAt(i)),
-                    child: ListTile(
-                      leading: Container(
-                        width: 40,
-                        height: 40,
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF111111),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: const Icon(Icons.directions_bike,
-                            color: Color(0xFF00FF41), size: 20),
-                      ),
-                      title: Text(r.name,
-                          style: const TextStyle(
-                              fontSize: 14, fontWeight: FontWeight.w500),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis),
-                      subtitle: Text(
-                          '$dateStr  ·  ${r.distanceKm.toStringAsFixed(2)} km',
-                          style: TextStyle(
-                              color: Colors.grey[600], fontSize: 11)),
-                    ),
-                  );
-                },
-              ),
-      ),
-    ]);
   }
 }
 

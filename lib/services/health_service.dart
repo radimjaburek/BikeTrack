@@ -1,5 +1,8 @@
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:health/health.dart';
+
+const _kChannel = MethodChannel('com.example.bike_track/health_settings');
 
 class HealthActivity {
   final String name;
@@ -44,6 +47,14 @@ class HealthService {
 
   Future<void> promptInstall() async {
     await _health.installHealthConnect();
+  }
+
+  Future<void> openPermissionsScreen() async {
+    try {
+      await _kChannel.invokeMethod('openHCPermissions');
+    } catch (e) {
+      debugPrint('openPermissionsScreen: $e');
+    }
   }
 
   Future<bool> hasPermissions() async {
